@@ -95,26 +95,28 @@ export function playWithMpv(torrent) {
       });
 
       stream.pipe(mpv.stdin);
-
       mpv.stdin.on("error", () => {});
 
+      // Progress reporter — use wt.progress (torrent-level, safe)
       let lastProgress = 0;
       const progressInterval = setInterval(() => {
-        if (videoFile.progress !== lastProgress) {
-          lastProgress = videoFile.progress;
-          const pct = (videoFile.progress * 100).toFixed(1);
-          const dl = fmtBytes(wt.downloadSpeed) + "/s";
-          const peers = wt.numPeers;
-          process.stdout.write(
-            `\r${chalk.gray("  Downloading:")} ${chalk.cyan(pct + "%")} ${chalk.gray("|")} ${chalk.green(dl)} ${chalk.gray("|")} ${chalk.yellow(peers + " peers")}`
-          );
-        }
+        try {
+          const pctNum = wt.progress || 0;
+          if (pctNum !== lastProgress) {
+            lastProgress = pctNum;
+            const pct = (pctNum * 100).toFixed(1);
+            const dl = fmtBytes(wt.downloadSpeed) + "/s";
+            const peers = wt.numPeers;
+            process.stdout.write(
+              `\r${chalk.gray("  Downloading:")} ${chalk.cyan(pct + "%")} ${chalk.gray("|")} ${chalk.green(dl)} ${chalk.gray("|")} ${chalk.yellow(peers + " peers")}`
+            );
+          }
+        } catch {}
       }, 1000);
 
-      mpv.on("close", (code) => {
+      mpv.on("close", () => {
         clearInterval(progressInterval);
         process.stdout.write("\r" + " ".repeat(80) + "\r");
-
         console.log(chalk.gray("  MPV closed."));
         client.destroy();
         resolve();
@@ -143,8 +145,6 @@ export function playWithMpv(torrent) {
       reject(err);
     });
 
-    wt.on("warning", (err) => {
-      // Ignore warnings
-    });
+    wt.on("warning", () => {});
   });
 }
