@@ -7,7 +7,10 @@
     "rattin": "./bin/rattin.js"
   },
   "scripts": {
-    "start": "node bin/rattin.js"
+    "start": "node bin/rattin.js",
+    "deps": "node scripts/check-deps.js",
+    "build": "node scripts/build.js",
+    "prebuild": "node scripts/check-deps.js"
   },
   "keywords": [
     "torrent",
@@ -26,5 +29,8 @@
   },
   "engines": {
     "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
   }
 }

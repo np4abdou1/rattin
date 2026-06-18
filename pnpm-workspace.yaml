@@ -1,5 +1,6 @@
 allowBuilds:
   bufferutil: true
+  esbuild: true
   ip-set: true
   node-datachannel: true
   utf-8-validate: true
