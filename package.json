@@ -1,0 +1,23 @@
+{
+  "name": "rattin",
+  "version": "1.0.0",
+  "description": "Stream torrents from the terminal using TMDB + WebTorrent + MPV",
+  "type": "module",
+  "bin": {
+    "rattin": "./bin/rattin.js"
+  },
+  "scripts": {
+    "start": "node bin/rattin.js"
+  },
+  "keywords": ["torrent", "stream", "cli", "mpv", "tmdb"],
+  "license": "GPL-3.0",
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "commander": "^13.1.0",
+    "inquirer": "^12.6.0",
+    "webtorrent": "^3.0.16"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
