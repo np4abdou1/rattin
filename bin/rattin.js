@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import "dotenv/config";
+
 import { checkDeps } from "../src/deps.js";
 checkDeps();
 
