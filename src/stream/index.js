@@ -8,7 +8,8 @@
 import { spawn } from "child_process";
 import chalk from "chalk";
 import WebTorrent from "webtorrent";
-import { PiecePrioritizer } from "./prioritizer.js";
+import { createSafeTorrent } from "./safe-torrent.js";
+import { PiecePrioritizer, isPieceReady } from "./prioritizer.js";
 import { StreamServer } from "./server.js";
 import { ProgressReporter } from "./progress.js";
 import { CleanupManager } from "./cleanup.js";
@@ -37,24 +38,6 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// Global handler for WebTorrent's internal null-piece crash
-// This is a known bug in WebTorrent 3.x where _updateWire races
-// with piece array initialization. We catch it and continue.
-let _webtorrentCrashCount = 0;
-process.on("uncaughtException", (err) => {
-  if (err.message && err.message.includes("Cannot read properties of null")) {
-    _webtorrentCrashCount++;
-    // Swallow the crash — WebTorrent will recover on next tick
-    // Only log the first few to avoid spam
-    if (_webtorrentCrashCount <= 3) {
-      process.stderr.write(chalk.gray(`  [webtorrent] recovered from null piece crash (#${_webtorrentCrashCount})\n`));
-    }
-    return; // Don't crash
-  }
-  // Other errors — let cleanup.js handle them via its own uncaughtException handler
-  // (do NOT rethrow here — that causes a fatal crash before cleanup runs)
-});
-
 export class StreamManager {
   constructor(torrentInfo) {
     this.torrentInfo = torrentInfo;
@@ -68,6 +51,11 @@ export class StreamManager {
 
     this.videoFile = null;
     this.startTime = Date.now();
+
+    // Manual download tracking (WebTorrent's piece tracking crashes after null-piece bug)
+    this._downloadedBytes = 0;
+    this._downloadSpeed = 0;
+    this._numPeers = 0;
   }
 
   async start() {
@@ -92,8 +80,8 @@ export class StreamManager {
       this.wt = await this._addTorrent(magnet);
 
       // 4. Wait for WebTorrent internal state to stabilize
-      log("Initializing torrent engine...");
-      await sleep(4000);
+      log("Initializing...");
+      await sleep(5000);
 
       // 5. Select the video file
       const files = this.wt.files;
@@ -104,26 +92,25 @@ export class StreamManager {
         throw new Error("No video files found in torrent");
       }
 
-      this._safeDeselectOthers();
+      // Safely select the video file
+      this._safeSelectFile();
 
       log(`Playing: ${chalk.green(this.videoFile.name)}`);
       log(`Size: ${fmtBytes(this.videoFile.length)}`);
-      log(`Peers: ${this.wt.numPeers}`);
 
-      // 6. Wait for initial pieces
-      log("Waiting for initial pieces...");
-      await this._waitForPieces(4, 25000);
-      log(`Pieces ready: ${this._countReadyPieces()}`);
+      // Setup manual download tracking
+      this._setupDownloadTracking();
 
-      // 7. Create prioritizer
+      log(`Peers: ${this._numPeers}`);
+
+      // 6. Create prioritizer
       this.prioritizer = new PiecePrioritizer(
         this.wt,
         this.wt.pieceLength,
         this.videoFile.length
       );
-      log("Piece prioritizer ready");
 
-      // 8. Start HTTP server
+      // 7. Start HTTP server
       this.server = new StreamServer(
         this.videoFile,
         this.wt,
@@ -134,16 +121,16 @@ export class StreamManager {
       this.cleanup.onCleanup(() => this.server.stop());
       log(`Server: ${this.server.getUrl()}`);
 
-      // 9. Start progress reporter
-      this.progress = new ProgressReporter(this.videoFile, this.wt, this.prioritizer);
+      // 8. Start progress reporter
+      this.progress = new ProgressReporter(this.videoFile, this.wt, this.prioritizer, this);
       this.progress.start(1000);
       this.cleanup.onCleanup(() => this.progress.stop());
 
-      // 10. Launch MPV
+      // 9. Launch MPV
       log("Launching MPV...");
       await this._launchMpv(this.server.getUrl());
 
-      // 11. Done
+      // 10. Done
       this.progress.printSummary();
       await this.cleanup.cleanup();
 
@@ -154,6 +141,41 @@ export class StreamManager {
       }
       throw err;
     }
+  }
+
+  /**
+   * Setup manual download tracking that doesn't rely on WebTorrent's
+   * corrupted piece array. Uses torrent 'download' event for speed
+   * and periodic polling for total bytes.
+   */
+  _setupDownloadTracking() {
+    // Track download stats using safe methods from createSafeTorrent
+    const updateStats = () => {
+      this._downloadedBytes = this.wt._safeDownloaded();
+      this._downloadSpeed = this.wt._safeSpeed();
+      this._numPeers = this.wt._safePeers();
+    };
+
+    this.wt.on("download", updateStats);
+    this.wt.on("wire", updateStats);
+    this.wt.on("wireDisconnected", updateStats);
+
+    // Poll for updates
+    setInterval(updateStats, 1000);
+
+    // Initial values
+    this._numPeers = this.wt._safePeers();
+  }
+
+  /**
+   * Get current download stats (safe, works after piece corruption)
+   */
+  getDownloadStats() {
+    return {
+      downloaded: this._downloadedBytes,
+      speed: this._downloadSpeed,
+      peers: this._numPeers,
+    };
   }
 
   _addTorrent(magnet) {
@@ -173,7 +195,9 @@ export class StreamManager {
 
       torrent.on("ready", () => {
         clearTimeout(timeout);
-        resolve(torrent);
+        // Wrap torrent to prevent null-piece crashes
+        const safe = createSafeTorrent(torrent);
+        resolve(safe);
       });
 
       torrent.on("error", (err) => {
@@ -185,41 +209,15 @@ export class StreamManager {
     });
   }
 
-  _waitForPieces(minPieces, timeoutMs) {
-    return new Promise((resolve) => {
-      const deadline = Date.now() + timeoutMs;
-
-      const check = () => {
-        if (Date.now() > deadline) { resolve(); return; }
-        if (!this.wt || !this.wt.pieces) { resolve(); return; }
-
-        let ready = 0;
-        const total = Math.min(this.wt.pieces.length, 100);
-        for (let i = 0; i < total; i++) {
-          const piece = this.wt.pieces[i];
-          if (piece && piece.missing === 0) ready++;
+  _safeSelectFile() {
+    try {
+      try { this.videoFile.select(); } catch {}
+      for (const f of this.wt.files) {
+        if (f !== this.videoFile) {
+          try { f.deselect(); } catch {}
         }
-
-        if (ready >= minPieces) resolve();
-        else setTimeout(check, 500);
-      };
-
-      check();
-    });
-  }
-
-  _countReadyPieces() {
-    if (!this.wt || !this.wt.pieces) return "0/0";
-    const start = Math.floor(this.videoFile.offset / this.wt.pieceLength);
-    const end = Math.floor((this.videoFile.offset + this.videoFile.length - 1) / this.wt.pieceLength);
-    let ready = 0;
-    const total = end - start + 1;
-    for (let i = start; i <= end; i++) {
-      if (i >= this.wt.pieces.length) break;
-      const piece = this.wt.pieces[i];
-      if (piece && piece.missing === 0) ready++;
-    }
-    return `${ready}/${total}`;
+      }
+    } catch {}
   }
 
   _selectFile(files) {
@@ -229,16 +227,6 @@ export class StreamManager {
       return files[this.torrentInfo.fileIdx];
     }
     return findLargestVideo(files);
-  }
-
-  _safeDeselectOthers() {
-    try {
-      for (const f of this.wt.files) {
-        if (f !== this.videoFile) {
-          try { f.deselect(); } catch {}
-        }
-      }
-    } catch {}
   }
 
   _launchMpv(streamUrl) {

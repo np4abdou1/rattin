@@ -142,13 +142,16 @@ export class StreamServer {
     // Verify pieces exist before attempting to read
     const allPiecesExist = this._checkPiecesExist(startPiece, endPiece);
     if (!allPiecesExist) {
-      this.log(`Missing pieces for range ${startPiece}-${endPiece}, buffering...`);
-      // Try to wait a bit more
-      const retryReady = await this.prioritizer.waitForRange(start, end, 5000);
-      if (!retryReady) {
-        res.writeHead(503, { "Retry-After": "1" });
-        res.end("Buffering");
-        return;
+      // Check file-level progress as fallback (works after piece corruption)
+      const fileReady = this.prioritizer.isDataAvailable(start, end);
+      if (!fileReady) {
+        this.log(`Missing pieces for range ${startPiece}-${endPiece}, buffering...`);
+        const retryReady = await this.prioritizer.waitForRange(start, end, 5000);
+        if (!retryReady) {
+          res.writeHead(503, { "Retry-After": "1" });
+          res.end("Buffering");
+          return;
+        }
       }
     }
 
@@ -252,9 +255,12 @@ export class StreamServer {
    * Check if pieces covering a range exist and are complete
    */
   _checkPiecesExist(startPiece, endPiece) {
+    const pieces = this.torrent?.pieces;
+    if (!pieces) return false;
     for (let i = startPiece; i <= endPiece; i++) {
-      const piece = this.torrent.pieces[i];
-      if (!piece) return false;
+      if (i >= pieces.length) return false;
+      const piece = pieces[i];
+      if (piece == null) return false;
       if (piece.missing > 0) return false;
     }
     return true;

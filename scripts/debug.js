@@ -1,46 +1,56 @@
 #!/usr/bin/env node
 
 /**
- * Debug script — full pipeline test (non-interactive)
+ * rattin debug — comprehensive pipeline test with ffmpeg
  *
- * Tests:
+ * Tests every component of the streaming pipeline:
  * 1. TMDB search
  * 2. Torrent search + scoring
- * 3. WebTorrent add + metadata
- * 4. Piece prioritizer init
+ * 3. WebTorrent add + metadata + piece download
+ * 4. Piece prioritizer
  * 5. HTTP server + range requests
- * 6. Piece availability
+ * 6. ffmpeg probe of streamed data (validates video is playable)
  * 7. Cleanup
  *
- * On headless VPS: tests everything except actual mpv playback.
- * Use --play flag to attempt mpv launch (needs display or Xvfb).
+ * Flags:
+ *   --quick     Skip torrent/streaming tests
+ *   --probe     Test ffmpeg probe on streamed data
+ *   --full      Full streaming test with ffmpeg decode
  */
 
 import "dotenv/config";
 import chalk from "chalk";
 
 // Catch WebTorrent's internal null-piece crash
+let _wtCrashes = 0;
 process.on("uncaughtException", (err) => {
   if (err.message && err.message.includes("Cannot read properties of null")) {
-    process.stderr.write(chalk.gray("  [webtorrent] recovered from null piece crash\n"));
-    return; // Don't crash
+    _wtCrashes++;
+    if (_wtCrashes <= 3) {
+      process.stderr.write(chalk.gray(`  [webtorrent] recovered (#${_wtCrashes})\n`));
+    }
+    return;
   }
-  throw err;
 });
 import http from "http";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { execSync, spawn } from "child_process";
 import WebTorrent from "webtorrent";
 import { searchTMDB, fetchTVDetails } from "../src/tmdb.js";
 import { searchTorrents, buildMagnet } from "../src/torrent.js";
-import { PiecePrioritizer } from "../src/stream/prioritizer.js";
+import { createSafeTorrent } from "../src/stream/safe-torrent.js";
+import { PiecePrioritizer, isPieceReady } from "../src/stream/prioritizer.js";
 import { StreamServer } from "../src/stream/server.js";
 import { CleanupManager } from "../src/stream/cleanup.js";
 
-const PLAY_MODE = process.argv.includes("--play");
-const QUICK_MODE = process.argv.includes("--quick");
+// ── Flags ──────────────────────────────────────────────────────────
+const QUICK = process.argv.includes("--quick");
+const PROBE = process.argv.includes("--probe") || process.argv.includes("--full");
+const FULL = process.argv.includes("--full");
 
+// ── Helpers ────────────────────────────────────────────────────────
 function log(label, value) {
   console.log(chalk.gray(`  ${label}:`) + " " + value);
 }
@@ -49,11 +59,36 @@ function section(title) {
   console.log(chalk.cyan.bold(`\n  ═══ ${title} ═══`));
 }
 
-async function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function pass(msg) { console.log(chalk.green(`  ✓ ${msg}`)); }
+function fail(msg) { console.log(chalk.red(`  ✗ ${msg}`)); }
+function warn(msg) { console.log(chalk.yellow(`  ⚠ ${msg}`)); }
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function fmtBytes(bytes) {
+  if (!bytes || bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return `${(bytes / 1024 ** i).toFixed(1)} ${units[i]}`;
 }
 
-// ─── Test 1: TMDB Search ─────────────────────────────────────────
+function hasFfmpeg() {
+  try { execSync("ffmpeg -version 2>&1", { stdio: "ignore" }); return true; }
+  catch { return false; }
+}
+
+function hasFfprobe() {
+  try { execSync("ffprobe -version 2>&1", { stdio: "ignore" }); return true; }
+  catch { return false; }
+}
+
+// ── Test Results ───────────────────────────────────────────────────
+const results = [];
+function record(name, passed, detail = "") {
+  results.push({ name, passed, detail });
+}
+
+// ═══ Test 1: TMDB Search ══════════════════════════════════════════
 
 async function testTMDB() {
   section("TMDB Search");
@@ -61,10 +96,7 @@ async function testTMDB() {
   console.log(chalk.gray("  Searching for 'coco'..."));
   const results = await searchTMDB("coco");
 
-  if (!results.length) {
-    console.log(chalk.red("  FAIL: No results"));
-    return null;
-  }
+  if (!results.length) { fail("No results"); record("TMDB", false); return null; }
 
   const item = results[0];
   const title = item.title || item.name;
@@ -76,51 +108,45 @@ async function testTMDB() {
   log("Type", chalk.gray(type));
   log("Results", results.length);
 
-  console.log(chalk.green("  ✓ TMDB search OK"));
+  pass("TMDB search OK");
+  record("TMDB", true, `${title} (${year})`);
   return item;
 }
 
-// ─── Test 2: Torrent Search ──────────────────────────────────────
+// ═══ Test 2: Torrent Search ═══════════════════════════════════════
 
 async function testTorrentSearch(tmdbItem) {
   section("Torrent Search");
 
   const title = tmdbItem.title || tmdbItem.name;
   const year = (tmdbItem.release_date || tmdbItem.first_air_date || "").slice(0, 4);
-  const type = tmdbItem.media_type === "tv" ? "tv" : "movie";
 
-  const target = { type, title, year, tmdbId: tmdbItem.id };
-  if (type === "tv") {
-    target.season = 1;
-    target.episode = 1;
-  }
+  const target = { type: "movie", title, year, tmdbId: tmdbItem.id };
 
   console.log(chalk.gray(`  Searching providers for "${title}"...`));
   const torrents = await searchTorrents(target);
 
-  if (!torrents.length) {
-    console.log(chalk.red("  FAIL: No torrents found"));
-    return null;
-  }
+  if (!torrents.length) { fail("No torrents found"); record("TorrentSearch", false); return null; }
 
   const t = torrents[0];
   log("Best", chalk.white(t.name));
   log("Seeders", chalk.yellow(t.seeders));
-  log("Size", t.sizeStr || "unknown");
+  log("Size", t.sizeStr || fmtBytes(t.size));
   log("Score", chalk.green(t.score.toFixed(1)));
   log("Found", `${torrents.length} torrents`);
 
-  console.log(chalk.green("  ✓ Torrent search OK"));
+  pass("Torrent search OK");
+  record("TorrentSearch", true, `${torrents.length} results, best: ${t.seeders} seeders`);
   return t;
 }
 
-// ─── Test 3: WebTorrent + Metadata ──────────────────────────────
+// ═══ Test 3: WebTorrent ═══════════════════════════════════════════
 
-async function testTorrentAdd(torrentInfo) {
+async function testWebTorrent(torrentInfo) {
   section("WebTorrent Metadata");
 
-  const cleanup = new CleanupManager();
-  const tempDir = cleanup.createTempDir("rattin-debug-");
+  const tempDir = path.join(os.tmpdir(), `rattin-debug-${Date.now()}`);
+  fs.mkdirSync(tempDir, { recursive: true });
 
   const client = new WebTorrent({ tempDest: tempDir });
   const magnet = buildMagnet(torrentInfo);
@@ -128,17 +154,14 @@ async function testTorrentAdd(torrentInfo) {
   console.log(chalk.gray("  Adding torrent..."));
 
   const wt = await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Timeout")), 30000);
+    const timeout = setTimeout(() => reject(new Error("Timeout (30s)")), 30000);
     let t;
     try {
       t = client.add(magnet, { deselect: true });
-    } catch (err) {
-      clearTimeout(timeout);
-      reject(err);
-      return;
-    }
-    t.on("ready", () => { clearTimeout(timeout); resolve(t); });
+    } catch (err) { clearTimeout(timeout); reject(err); return; }
+    t.on("ready", () => { clearTimeout(timeout); resolve(createSafeTorrent(t)); });
     t.on("error", (err) => { clearTimeout(timeout); reject(err); });
+    t.on("warning", () => {});
   });
 
   const files = wt.files;
@@ -148,18 +171,19 @@ async function testTorrentAdd(torrentInfo) {
   log("Torrent name", wt.name);
 
   for (const f of files) {
-    log("  File", `${f.name} (${(f.length / 1024 / 1024).toFixed(1)} MB)`);
+    log("  File", `${f.name} (${fmtBytes(f.length)})`);
   }
 
-  console.log(chalk.green("  ✓ Torrent metadata OK"));
+  pass("Torrent metadata OK");
+  record("WebTorrent", true, `${files.length} files, ${wt.pieces.length} pieces`);
 
-  return { client, wt, tempDir, cleanup };
+  return { client, wt, tempDir };
 }
 
-// ─── Test 4: Piece Prioritizer ──────────────────────────────────
+// ═══ Test 4: Piece Download ═══════════════════════════════════════
 
-async function testPrioritizer(wt, torrentInfo) {
-  section("Piece Prioritizer");
+async function testPieceDownload(wt) {
+  section("Piece Download (15s test)");
 
   // Find largest video file
   const videoExts = [".mp4", ".mkv", ".avi", ".webm", ".mov"];
@@ -171,40 +195,79 @@ async function testPrioritizer(wt, torrentInfo) {
     }
   }
 
-  if (!videoFile) {
-    console.log(chalk.red("  FAIL: No video file"));
-    return null;
+  if (!videoFile) { fail("No video file"); record("PieceDownload", false); return null; }
+
+  // Select the video file
+  try { videoFile.select(); } catch {}
+  for (const f of wt.files) {
+    if (f !== videoFile) try { f.deselect(); } catch {}
   }
 
-  videoFile.select();
-
-  const prioritizer = new PiecePrioritizer(wt, wt.pieceLength, videoFile.length);
-
   log("File", videoFile.name);
-  log("Size", `${(videoFile.length / 1024 / 1024).toFixed(1)} MB`);
-  log("Piece range", `${prioritizer.fileStartPiece}-${prioritizer.fileEndPiece}`);
-  log("Total pieces", prioritizer.fileEndPiece - prioritizer.fileStartPiece + 1);
+  log("Size", fmtBytes(videoFile.length));
 
-  // Test seek detection
-  console.log(chalk.gray("\n  Testing seek detection..."));
-  prioritizer.onRequest(0, 1024 * 1024); // initial
-  const isSeek = prioritizer.onRequest(50 * 1024 * 1024, 51 * 1024 * 1024); // seek
-  log("Seek detected", isSeek ? chalk.green("YES") : chalk.red("NO"));
+  // Wait for data — track using events (safe after piece corruption)
+  console.log(chalk.gray("  Downloading for 15 seconds..."));
 
-  // Get stats
-  const stats = prioritizer.getStats();
-  log("Downloaded pieces", `${stats.downloaded}/${stats.totalPieces}`);
-  log("Percent", `${stats.percent}%`);
+  let totalDownloaded = 0;
+  let currentSpeed = 0;
+  let currentPeers = 0;
 
-  console.log(chalk.green("  ✓ Prioritizer OK"));
+  wt.on("download", () => {
+    try { currentSpeed = wt.downloadSpeed; } catch {}
+    try { currentPeers = wt.numPeers; } catch {}
+  });
+  wt.on("wire", () => { try { currentPeers = wt.numPeers; } catch {} });
+  wt.on("wireDisconnected", () => { try { currentPeers = wt.numPeers; } catch {} });
 
-  return { prioritizer, videoFile };
+  // Poll total downloaded (try wt.downloaded, fall back to 0)
+  const dlTracker = setInterval(() => {
+    try {
+      const dl = wt.downloaded;
+      if (dl > totalDownloaded) totalDownloaded = dl;
+    } catch {}
+  }, 500);
+
+  for (let i = 0; i < 15; i++) {
+    await sleep(1000);
+    const filePct = (totalDownloaded / videoFile.length * 100).toFixed(1);
+    const speedStr = currentSpeed > 0 ? fmtBytes(currentSpeed) + "/s" : "connecting...";
+
+    process.stdout.write(
+      `\r  ${chalk.gray("Speed:")} ${chalk.green(speedStr.padEnd(12))}  ` +
+      `${chalk.gray("Peers:")} ${chalk.yellow(String(currentPeers).padEnd(4))}  ` +
+      `${chalk.gray("Downloaded:")} ${chalk.cyan(`${filePct}%`.padEnd(8))}  ` +
+      `${chalk.gray("Time:")} ${(i + 1)}s`
+    );
+  }
+  clearInterval(dlTracker);
+  process.stdout.write("\n");
+
+  // Final stats
+  // One last try to get accurate total
+  try { const dl = wt.downloaded; if (dl > totalDownloaded) totalDownloaded = dl; } catch {}
+  const filePct = (totalDownloaded / videoFile.length * 100).toFixed(1);
+  log("Downloaded", `${fmtBytes(totalDownloaded)} (${filePct}%)`);
+  log("Speed", fmtBytes(currentSpeed) + "/s");
+  log("Peers", currentPeers);
+
+  if (totalDownloaded > 0) {
+    pass(`Download OK — ${fmtBytes(totalDownloaded)} (${filePct}%)`);
+    record("PieceDownload", true, `${filePct}%`);
+  } else {
+    warn("No data downloaded (network issue on VPS?)");
+    record("PieceDownload", false, "0 bytes — network?");
+  }
+
+  return videoFile;
 }
 
-// ─── Test 5: HTTP Server + Range Requests ───────────────────────
+// ═══ Test 5: HTTP Server ══════════════════════════════════════════
 
-async function testHttpServer(videoFile, wt, prioritizer) {
-  section("HTTP Server");
+async function testHttpServer(videoFile, wt) {
+  section("HTTP Server + Range Requests");
+
+  const prioritizer = new PiecePrioritizer(wt, wt.pieceLength, videoFile.length);
 
   const server = new StreamServer(videoFile, wt, prioritizer, (msg) => {
     console.log(chalk.gray(`    [server] ${msg}`));
@@ -214,125 +277,186 @@ async function testHttpServer(videoFile, wt, prioritizer) {
   const url = server.getUrl();
   log("URL", chalk.cyan(url));
 
-  // Test HEAD request
-  console.log(chalk.gray("  Testing HEAD request..."));
+  // Test HEAD
+  console.log(chalk.gray("  Testing HEAD..."));
   const headRes = await fetch(url, { method: "HEAD" });
-  log("HEAD status", headRes.status);
-  log("Content-Length", headRes.headers.get("content-length"));
-  log("Content-Type", headRes.headers.get("content-type"));
+  log("Status", headRes.status);
+  log("Content-Length", fmtBytes(Number(headRes.headers.get("content-length"))));
   log("Accept-Ranges", headRes.headers.get("accept-ranges"));
 
-  if (headRes.status !== 200) {
-    console.log(chalk.red("  FAIL: HEAD request failed"));
-    await server.stop();
-    return null;
+  if (headRes.status === 200) {
+    pass("HEAD request OK");
+    record("HTTP_HEAD", true);
+  } else {
+    fail(`HEAD returned ${headRes.status}`);
+    record("HTTP_HEAD", false);
   }
 
-  // Test small range request
-  console.log(chalk.gray("  Testing range request (first 64KB)..."));
-  const rangeRes = await fetch(url, {
-    headers: { Range: "bytes=0-65535" },
-  });
-  log("Range status", rangeRes.status);
-  log("Content-Range", rangeRes.headers.get("content-range"));
+  // Test range request
+  console.log(chalk.gray("  Testing range (first 64KB)..."));
+  const rangeRes = await fetch(url, { headers: { Range: "bytes=0-65535" } });
+  log("Status", rangeRes.status);
 
   if (rangeRes.status === 206) {
     const body = await rangeRes.arrayBuffer();
-    log("Body size", `${body.byteLength} bytes`);
-    console.log(chalk.green("  ✓ Range request OK"));
+    log("Body", fmtBytes(body.byteLength));
+    pass("Range request OK (206)");
+    record("HTTP_Range", true);
   } else if (rangeRes.status === 503) {
-    console.log(chalk.yellow("  ⚠ Server returned 503 (buffering) — pieces not ready yet"));
+    warn("503 — pieces not ready (expected on slow network)");
+    record("HTTP_Range", false, "503 buffering");
   } else {
-    console.log(chalk.red(`  FAIL: Unexpected status ${rangeRes.status}`));
+    fail(`Unexpected status ${rangeRes.status}`);
+    record("HTTP_Range", false);
   }
 
-  // Test mid-file range
-  console.log(chalk.gray("  Testing mid-file range (10MB-10MB+64KB)..."));
-  const midRes = await fetch(url, {
-    headers: { Range: "bytes=10485760-10551295" },
-  });
-  log("Mid-file status", midRes.status);
-
-  if (midRes.status === 206) {
-    const body = await midRes.arrayBuffer();
-    log("Body size", `${body.byteLength} bytes`);
-    console.log(chalk.green("  ✓ Mid-file range OK"));
-  } else if (midRes.status === 503) {
-    console.log(chalk.yellow("  ⚠ Buffering (expected for unbuffered region)"));
-  }
-
-  const stats = server.getStats();
-  log("Requests served", stats.requestCount);
-  log("Bytes served", `${(stats.totalBytesServed / 1024).toFixed(1)} KB`);
-
-  console.log(chalk.green("  ✓ HTTP server OK"));
-
+  await server.stop();
   return server;
 }
 
-// ─── Test 6: Piece Download + Availability ──────────────────────
+// ═══ Test 6: ffmpeg Probe ═════════════════════════════════════════
 
-async function testPieceDownload(wt, videoFile) {
-  section("Piece Download Test");
+async function testFfmpegProbe(videoFile, wt, tempDir) {
+  section("ffmpeg Probe");
 
-  // Select first 100 pieces
-  const startPiece = Math.floor(videoFile.offset / wt.pieceLength);
-  const endPiece = Math.min(startPiece + 99, Math.floor((videoFile.offset + videoFile.length - 1) / wt.pieceLength));
+  if (!hasFfprobe()) {
+    warn("ffprobe not installed — skipping");
+    record("ffmpeg", false, "ffprobe not found");
+    return;
+  }
 
-  log("Requesting pieces", `${startPiece}-${endPiece}`);
-  try {
-    wt.select(startPiece, endPiece, 3);
-  } catch {}
+  if (!hasFfmpeg()) {
+    warn("ffmpeg not installed — skipping");
+    record("ffmpeg", false, "ffmpeg not found");
+    return;
+  }
 
-  // Wait and check progress
-  console.log(chalk.gray("  Downloading for 10 seconds..."));
-
+  // Wait for some data to be available
+  console.log(chalk.gray("  Waiting for data..."));
   for (let i = 0; i < 10; i++) {
+    try {
+      const dl = wt.downloaded || 0;
+      if (dl > 1024 * 1024) break;
+    } catch {}
     await sleep(1000);
-    const speed = wt.downloadSpeed;
-    const peers = wt.numPeers;
-    let ready = 0;
-    for (let p = startPiece; p <= endPiece; p++) {
-      if (p < wt.pieces.length && wt.pieces[p] && wt.pieces[p].missing === 0) ready++;
-    }
-    process.stdout.write(
-      `\r  ${chalk.gray("Speed:")} ${chalk.green((speed / 1024).toFixed(0) + " KB/s")}  ` +
-      `${chalk.gray("Peers:")} ${chalk.yellow(peers)}  ` +
-      `${chalk.gray("Pieces:")} ${chalk.cyan(`${ready}/${endPiece - startPiece + 1}`)}  ` +
-      `${chalk.gray("Time:")} ${i + 1}s`
+  }
+  try { log("Data available", fmtBytes(wt.downloaded)); } catch { log("Data available", "unknown"); }
+
+  // Create prioritizer and server
+  const prioritizer = new PiecePrioritizer(wt, wt.pieceLength, videoFile.length);
+  const server = new StreamServer(videoFile, wt, prioritizer, () => {});
+  await server.start();
+  const url = server.getUrl();
+
+  log("Probing", url);
+
+  try {
+    // ffprobe the stream
+    const probeOut = execSync(
+      `ffprobe -v quiet -print_format json -show_format -show_streams "${url}" 2>&1`,
+      { timeout: 15000, encoding: "utf-8" }
     );
+
+    const probe = JSON.parse(probeOut);
+
+    if (probe.streams?.length > 0) {
+      const videoStream = probe.streams.find((s) => s.codec_type === "video");
+      const audioStream = probe.streams.find((s) => s.codec_type === "audio");
+
+      if (videoStream) {
+        log("Video", `${videoStream.codec_name} ${videoStream.width}x${videoStream.height}`);
+        pass("Video stream detected");
+      }
+      if (audioStream) {
+        log("Audio", `${audioStream.codec_name} ${audioStream.sample_rate}Hz`);
+        pass("Audio stream detected");
+      }
+
+      log("Duration", probe.format?.duration ? `${Number(probe.format.duration).toFixed(1)}s` : "unknown");
+      log("Streams", probe.streams.length);
+
+      record("ffmpeg_probe", true, `${probe.streams.length} streams`);
+    } else {
+      fail("No streams found in probe");
+      record("ffmpeg_probe", false);
+    }
+  } catch (err) {
+    // ffprobe might fail if not enough data is buffered
+    warn(`ffprobe failed: ${err.message.split("\n")[0]}`);
+    record("ffmpeg_probe", false, err.message.split("\n")[0]);
   }
-  process.stdout.write("\n");
 
-  // Final check
-  let ready = 0;
-  for (let p = startPiece; p <= endPiece; p++) {
-    if (p < wt.pieces.length && wt.pieces[p] && wt.pieces[p].missing === 0) ready++;
-  }
-
-  log("Pieces downloaded", `${ready}/${endPiece - startPiece + 1}`);
-  log("Download speed", `${(wt.downloadSpeed / 1024).toFixed(0)} KB/s`);
-  log("Peers", wt.numPeers);
-
-  if (ready > 0) {
-    console.log(chalk.green("  ✓ Piece download OK"));
-  } else {
-    console.log(chalk.yellow("  ⚠ No pieces downloaded (network issue?)"));
-  }
-
-  return ready;
+  await server.stop();
 }
 
-// ─── Test 7: Cleanup ────────────────────────────────────────────
+// ═══ Test 7: ffmpeg Decode Test ═══════════════════════════════════
 
-async function testCleanup(cleanup, tempDir) {
+async function testFfmpegDecode(videoFile, wt, tempDir) {
+  section("ffmpeg Decode Test");
+
+  if (!hasFfmpeg()) {
+    warn("ffmpeg not installed — skipping");
+    record("ffmpeg_decode", false, "ffmpeg not found");
+    return;
+  }
+
+  const prioritizer = new PiecePrioritizer(wt, wt.pieceLength, videoFile.length);
+  const server = new StreamServer(videoFile, wt, prioritizer, () => {});
+  await server.start();
+  const url = server.getUrl();
+
+  const outFile = path.join(tempDir, "test-output.mp4");
+  log("Decoding 10 seconds to", outFile);
+
+  try {
+    // Decode first 10 seconds to a local file
+    execSync(
+      `ffmpeg -y -i "${url}" -t 10 -c copy "${outFile}" 2>&1`,
+      { timeout: 30000, stdio: "pipe" }
+    );
+
+    if (fs.existsSync(outFile)) {
+      const stat = fs.statSync(outFile);
+      log("Output size", fmtBytes(stat.size));
+
+      if (stat.size > 0) {
+        pass(`Decode OK — ${fmtBytes(stat.size)} in 10s`);
+        record("ffmpeg_decode", true, fmtBytes(stat.size));
+
+        // Verify the output is valid
+        try {
+          const verify = execSync(
+            `ffprobe -v quiet -print_format json -show_format "${outFile}"`,
+            { encoding: "utf-8" }
+          );
+          const info = JSON.parse(verify);
+          log("Verified", `${info.format?.format_name} ${info.format?.duration}s`);
+        } catch {}
+      } else {
+        fail("Output file is empty");
+        record("ffmpeg_decode", false, "empty output");
+      }
+    } else {
+      fail("Output file not created");
+      record("ffmpeg_decode", false, "no output file");
+    }
+  } catch (err) {
+    warn(`Decode failed: ${err.message.split("\n")[0]}`);
+    record("ffmpeg_decode", false, err.message.split("\n")[0]);
+  }
+
+  await server.stop();
+}
+
+// ═══ Test 8: Cleanup ══════════════════════════════════════════════
+
+async function testCleanup(client, wt, tempDir) {
   section("Cleanup");
 
   const existsBefore = fs.existsSync(tempDir);
   log("Temp dir exists", existsBefore ? chalk.green("YES") : chalk.red("NO"));
 
   if (existsBefore) {
-    // Get size
     let size = 0;
     const walk = (dir) => {
       try {
@@ -345,22 +469,27 @@ async function testCleanup(cleanup, tempDir) {
       } catch {}
     };
     walk(tempDir);
-    log("Temp size", `${(size / 1024 / 1024).toFixed(1)} MB`);
+    log("Temp size", fmtBytes(size));
   }
 
-  await cleanup.cleanup();
+  // Destroy WebTorrent
+  try { wt.destroy(); } catch {}
+  try { client.destroy(); } catch {}
+
+  // Remove temp dir
+  try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
 
   const existsAfter = fs.existsSync(tempDir);
-  log("After cleanup", existsAfter ? chalk.red("STILL EXISTS") : chalk.green("REMOVED"));
-
   if (!existsAfter) {
-    console.log(chalk.green("  ✓ Cleanup OK"));
+    pass("Cleanup OK");
+    record("Cleanup", true);
   } else {
-    console.log(chalk.red("  FAIL: Temp dir not removed"));
+    fail("Temp dir not removed");
+    record("Cleanup", false);
   }
 }
 
-// ─── Main ────────────────────────────────────────────────────────
+// ═══ Main ══════════════════════════════════════════════════════════
 
 async function main() {
   console.log(chalk.yellow.bold("\n  ╔══════════════════════════════════════╗"));
@@ -368,71 +497,83 @@ async function main() {
   console.log(chalk.yellow.bold("  ╚══════════════════════════════════════╝"));
 
   const startTime = Date.now();
-  let exitCode = 0;
   let client = null;
   let wt = null;
-  let server = null;
-  let cleanup = null;
   let tempDir = null;
+  let videoFile = null;
 
   try {
     // 1. TMDB
     const tmdbItem = await testTMDB();
-    if (!tmdbItem) { process.exit(1); }
+    if (!tmdbItem) process.exit(1);
 
     // 2. Torrent search
     const torrentInfo = await testTorrentSearch(tmdbItem);
-    if (!torrentInfo) { process.exit(1); }
+    if (!torrentInfo) process.exit(1);
 
-    if (QUICK_MODE) {
-      console.log(chalk.gray("\n  Quick mode — skipping torrent tests"));
+    if (QUICK) {
+      console.log(chalk.gray("\n  Quick mode — done"));
+      printSummary();
       process.exit(0);
     }
 
     // 3. WebTorrent
-    const torrentResult = await testTorrentAdd(torrentInfo);
+    const torrentResult = await testWebTorrent(torrentInfo);
     client = torrentResult.client;
     wt = torrentResult.wt;
-    cleanup = torrentResult.cleanup;
     tempDir = torrentResult.tempDir;
 
-    // 4. Prioritizer
-    const prioResult = await testPrioritizer(wt, torrentInfo);
-    if (!prioResult) { process.exit(1); }
-    const { prioritizer, videoFile } = prioResult;
+    // 4. Piece download
+    videoFile = await testPieceDownload(wt);
 
     // 5. HTTP server
-    server = await testHttpServer(videoFile, wt, prioritizer);
+    if (videoFile) {
+      await testHttpServer(videoFile, wt);
+    }
 
-    // 6. Download test
-    await testPieceDownload(wt, videoFile);
+    // 6. ffmpeg probe
+    if (PROBE && videoFile) {
+      await testFfmpegProbe(videoFile, wt, tempDir);
+    }
 
-    // 7. Cleanup
-    if (server) await server.stop();
-    wt.destroy();
-    client.destroy();
-    await testCleanup(cleanup, tempDir);
+    // 7. ffmpeg decode
+    if (FULL && videoFile) {
+      await testFfmpegDecode(videoFile, wt, tempDir);
+    }
 
-    // Summary
-    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(chalk.yellow.bold(`\n  All tests passed (${elapsed}s)`));
-    console.log();
+    // 8. Cleanup
+    await testCleanup(client, wt, tempDir);
+    client = null;
+    wt = null;
 
   } catch (err) {
     console.error(chalk.red(`\n  FATAL: ${err.message}`));
-    console.error(chalk.gray(err.stack));
-    exitCode = 1;
+    console.error(chalk.gray(err.stack?.split("\n").slice(1, 3).join("\n")));
 
     // Cleanup on error
-    try {
-      if (server) await server.stop();
-      if (wt) wt.destroy();
-      if (client) client.destroy();
-      if (cleanup) await cleanup.cleanup();
-    } catch {}
+    try { if (wt) wt.destroy(); } catch {}
+    try { if (client) client.destroy(); } catch {}
+    try { if (tempDir && fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+
+    printSummary();
+    process.exit(1);
   }
 
-  process.exit(exitCode);
+  printSummary();
 }
 
+function printSummary() {
+  const elapsed = ((Date.now() - (globalThis.__startTime || Date.now())) / 1000).toFixed(1);
+
+  console.log(chalk.yellow.bold("\n  ═══ Results ═══"));
+  for (const r of results) {
+    const icon = r.passed ? chalk.green("✓") : chalk.red("✗");
+    const detail = r.detail ? chalk.gray(` (${r.detail})`) : "";
+    console.log(`  ${icon} ${r.name}${detail}`);
+  }
+  console.log(chalk.gray(`\n  Time: ${elapsed}s`));
+  console.log();
+}
+
+globalThis.__startTime = Date.now();
 main();

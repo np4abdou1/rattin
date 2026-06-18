@@ -8,7 +8,7 @@
  * Priority levels (WebTorrent):
  *   0 = dont-download
  *   1 = normal
- *   2 = high
+   2 = high
  *   3 = highest
  */
 
@@ -19,10 +19,27 @@ const PIECE_PRIORITY = {
   HIGHEST: 3,
 };
 
-const SEEK_DETECT_THRESHOLD_SEC = 5;
 const PREFETCH_AHEAD_SEC = 30;
-const PREFETCH_DISTANCE_SEC = 120;
 const STALL_TIMEOUT_MS = 3000;
+
+/**
+ * Safely check if a piece is downloaded (guards against null)
+ */
+function isPieceReady(pieces, index) {
+  if (!pieces || index < 0 || index >= pieces.length) return false;
+  const piece = pieces[index];
+  return piece != null && piece.missing === 0;
+}
+
+/**
+ * Safely get piece missing count (guards against null)
+ */
+function getPieceMissing(pieces, index) {
+  if (!pieces || index < 0 || index >= pieces.length) return Infinity;
+  const piece = pieces[index];
+  if (piece == null) return Infinity;
+  return piece.missing;
+}
 
 export class PiecePrioritizer {
   constructor(torrent, pieceLength, fileSize) {
@@ -31,7 +48,7 @@ export class PiecePrioritizer {
     this.fileSize = fileSize;
 
     // State tracking
-    this.currentOffset = 0;          // last byte position served to player
+    this.currentOffset = 0;
     this.lastPrioritizationTime = 0;
     this.isSeeking = false;
     this.seekTarget = null;
@@ -41,12 +58,51 @@ export class PiecePrioritizer {
     this.fileEndPiece = Math.floor((fileSize - 1) / pieceLength);
 
     // Playback tracking
-    this.playbackSpeed = 0;          // bytes/sec estimate
-    this.lastSpeedSample = 0;
-    this.lastSpeedTime = 0;
+    this.playbackSpeed = 0;
 
     // Priority state
     this._lastPriorityMap = null;
+  }
+
+  /**
+   * Safe accessor for torrent.pieces
+   */
+  get pieces() {
+    return this.torrent?.pieces || [];
+  }
+
+  get maxPieceIndex() {
+    return this.pieces.length - 1;
+  }
+
+  /**
+   * Check if enough data is available using file-level tracking
+   * (works even when piece array is corrupted by WebTorrent crash)
+   */
+  isDataAvailable(startByte, endByte) {
+    try {
+      const downloaded = this.torrent?.downloaded || 0;
+      // If we've downloaded more than the requested range, data is likely available
+      return downloaded >= endByte;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Get file-level progress (safe, works after crashes)
+   */
+  getFileProgress() {
+    try {
+      const downloaded = this.torrent?.downloaded || 0;
+      return {
+        downloaded,
+        total: this.fileSize,
+        percent: this.fileSize > 0 ? (downloaded / this.fileSize * 100).toFixed(1) : "0.0",
+      };
+    } catch {
+      return { downloaded: 0, total: this.fileSize, percent: "0.0" };
+    }
   }
 
   /**
@@ -59,9 +115,10 @@ export class PiecePrioritizer {
     );
     const endPiece = Math.min(
       this.fileEndPiece,
-      Math.floor(endByte / this.pieceLength)
+      Math.floor(endByte / this.pieceLength),
+      this.maxPieceIndex
     );
-    return { startPiece, endPiece };
+    return { startPiece, endPiece: Math.max(startPiece, endPiece) };
   }
 
   /**
@@ -72,7 +129,7 @@ export class PiecePrioritizer {
     const lookaheadPieces = Math.ceil(lookaheadBytes / this.pieceLength);
     return {
       startPiece,
-      endPiece: Math.min(endPiece + lookaheadPieces, this.fileEndPiece),
+      endPiece: Math.min(endPiece + lookaheadPieces, this.fileEndPiece, this.maxPieceIndex),
       criticalStart: startPiece,
       criticalEnd: endPiece,
     };
@@ -84,7 +141,6 @@ export class PiecePrioritizer {
    */
   onRequest(startByte, endByte) {
     const now = Date.now();
-    const timeSinceLast = now - this.lastPrioritizationTime;
 
     // Detect seek: large gap from last served position
     const byteGap = Math.abs(startByte - this.currentOffset);
@@ -94,8 +150,7 @@ export class PiecePrioritizer {
       this.isSeeking = true;
       this.seekTarget = startByte;
       this._onSeek(startByte, endByte);
-    } else if (timeSinceLast > 500) {
-      // Normal playback — update position
+    } else if (now - this.lastPrioritizationTime > 500) {
       this.currentOffset = startByte;
       this._onPlayback(startByte, endByte);
     }
@@ -113,27 +168,21 @@ export class PiecePrioritizer {
     const pieces = this.getNeededPieces(startByte, endByte, PREFETCH_AHEAD_SEC * this._getBytesPerSec());
     const { startPiece, endPiece, criticalStart, criticalEnd } = pieces;
 
-    // Find current playback position pieces
-    const currentPiece = Math.floor(this.currentOffset / this.pieceLength);
-
-    console.log(`[prioritizer] SEEK: byte ${startByte} → piece ${startPiece}-${endPiece} (was at piece ${currentPiece})`);
-
-    // Build priority map
     const priorities = new Map();
 
-    // 1. Critical pieces (what mpv needs RIGHT NOW) → HIGHEST
+    // Critical pieces → HIGHEST
     for (let i = criticalStart; i <= criticalEnd; i++) {
       priorities.set(i, PIECE_PRIORITY.HIGHEST);
     }
 
-    // 2. Prefetch pieces (ahead of current request) → HIGH
+    // Prefetch → HIGH
     for (let i = criticalEnd + 1; i <= endPiece; i++) {
       priorities.set(i, PIECE_PRIORITY.HIGH);
     }
 
-    // 3. Pieces far from seek target → DONT_DOWNLOAD (save bandwidth)
-    const deadZone = 50; // pieces
-    for (let i = this.fileStartPiece; i <= this.fileEndPiece; i++) {
+    // Far from seek target → DONT_DOWNLOAD
+    const deadZone = 50;
+    for (let i = this.fileStartPiece; i <= this.fileEndPiece && i <= this.maxPieceIndex; i++) {
       if (!priorities.has(i)) {
         if (Math.abs(i - startPiece) > deadZone + (endPiece - startPiece)) {
           priorities.set(i, PIECE_PRIORITY.DONT_DOWNLOAD);
@@ -148,33 +197,28 @@ export class PiecePrioritizer {
   }
 
   /**
-   * Handle normal sequential playback: prioritize ahead, deprioritize behind
+   * Handle normal sequential playback
    */
   _onPlayback(startByte, endByte) {
     const pieces = this.getNeededPieces(startByte, endByte, PREFETCH_AHEAD_SEC * this._getBytesPerSec());
-    const { startPiece, endPiece, criticalEnd } = pieces;
+    const { startPiece, criticalEnd } = pieces;
 
     const priorities = new Map();
 
-    // 1. Next 10 seconds → HIGH
+    // Next 10 seconds → HIGH
     const nearAhead = Math.ceil(10 * this._getBytesPerSec() / this.pieceLength);
-    for (let i = startPiece; i <= Math.min(criticalEnd + nearAhead, this.fileEndPiece); i++) {
+    for (let i = startPiece; i <= Math.min(criticalEnd + nearAhead, this.fileEndPiece, this.maxPieceIndex); i++) {
       priorities.set(i, PIECE_PRIORITY.HIGH);
     }
 
-    // 2. Next 30 seconds → NORMAL
+    // Next 30 seconds → NORMAL
     const midAhead = Math.ceil(PREFETCH_AHEAD_SEC * this._getBytesPerSec() / this.pieceLength);
-    for (let i = criticalEnd + nearAhead + 1; i <= Math.min(criticalEnd + midAhead, this.fileEndPiece); i++) {
+    for (let i = criticalEnd + nearAhead + 1; i <= Math.min(criticalEnd + midAhead, this.fileEndPiece, this.maxPieceIndex); i++) {
       priorities.set(i, PIECE_PRIORITY.NORMAL);
     }
 
-    // 3. Far ahead → LOW priority (WebTorrent can fetch opportunistically)
-    for (let i = criticalEnd + midAhead + 1; i <= this.fileEndPiece; i++) {
-      priorities.set(i, PIECE_PRIORITY.NORMAL);
-    }
-
-    // 4. Already played pieces → DONT_DOWNLOAD (we've already served them)
-    for (let i = this.fileStartPiece; i < startPiece - 5; i++) {
+    // Already played → DONT_DOWNLOAD
+    for (let i = this.fileStartPiece; i < startPiece - 5 && i <= this.maxPieceIndex; i++) {
       if (!priorities.has(i)) {
         priorities.set(i, PIECE_PRIORITY.DONT_DOWNLOAD);
       }
@@ -184,59 +228,38 @@ export class PiecePrioritizer {
   }
 
   /**
-   * Apply priority map to torrent pieces (batched, efficient)
+   * Apply priority map to torrent pieces (batched, safe)
    */
   _applyPriorities(priorities) {
-    // Skip if torrent isn't fully initialized
-    if (!this.torrent || !this.torrent.pieces || this.torrent.pieces.length === 0) return;
+    const pieces = this.pieces;
+    if (pieces.length === 0) return;
 
-    const maxPiece = this.torrent.pieces.length - 1;
+    const maxPiece = this.maxPieceIndex;
 
-    // Avoid redundant updates
     const key = this._priorityMapKey(priorities);
     if (key === this._lastPriorityMap) return;
     this._lastPriorityMap = key;
 
-    // Batch by priority level for fewer API calls
+    // Batch by priority level
     const batches = new Map();
     for (const [piece, priority] of priorities) {
-      // Validate piece index is in range
       if (piece < 0 || piece > maxPiece) continue;
       if (!batches.has(priority)) batches.set(priority, []);
       batches.get(priority).push(piece);
     }
 
-    for (const [priority, pieces] of batches) {
-      if (priority === PIECE_PRIORITY.DONT_DOWNLOAD) {
-        // Deselect ranges
-        for (let i = 0; i < pieces.length; i++) {
-          const start = pieces[i];
-          let end = start;
-          while (i + 1 < pieces.length && pieces[i + 1] === end + 1) {
-            end = pieces[i + 1];
-            i++;
-          }
-          // Clamp end to valid range
-          end = Math.min(end, maxPiece);
-          try {
-            this.torrent.select(start, end, 0);
-          } catch {}
+    for (const [priority, pieceList] of batches) {
+      for (let i = 0; i < pieceList.length; i++) {
+        const start = pieceList[i];
+        let end = start;
+        while (i + 1 < pieceList.length && pieceList[i + 1] === end + 1) {
+          end = pieceList[i + 1];
+          i++;
         }
-      } else {
-        // Select ranges with priority
-        for (let i = 0; i < pieces.length; i++) {
-          const start = pieces[i];
-          let end = start;
-          while (i + 1 < pieces.length && pieces[i + 1] === end + 1) {
-            end = pieces[i + 1];
-            i++;
-          }
-          // Clamp end to valid range
-          end = Math.min(end, maxPiece);
-          try {
-            this.torrent.select(start, end, priority);
-          } catch {}
-        }
+        end = Math.min(end, maxPiece);
+        try {
+          this.torrent.select(start, end, priority);
+        } catch {}
       }
     }
   }
@@ -247,16 +270,15 @@ export class PiecePrioritizer {
   async waitForRange(startByte, endByte, timeoutMs = STALL_TIMEOUT_MS) {
     const { startPiece, endPiece } = this.getPieceRange(startByte, endByte);
     const deadline = Date.now() + timeoutMs;
+    const pieces = this.pieces;
 
-    // Guard: check torrent is ready
-    if (!this.torrent || !this.torrent.pieces) return false;
+    if (pieces.length === 0) return false;
 
-    const maxPiece = this.torrent.pieces.length - 1;
+    const maxPiece = this.maxPieceIndex;
     const clampedEnd = Math.min(endPiece, maxPiece);
 
     // Re-prioritize this range as highest
     for (let i = startPiece; i <= clampedEnd; i++) {
-      if (i > maxPiece) break;
       try {
         this.torrent.select(i, i, PIECE_PRIORITY.HIGHEST);
       } catch {}
@@ -265,38 +287,52 @@ export class PiecePrioritizer {
     return new Promise((resolve) => {
       const check = () => {
         if (Date.now() > deadline) {
-          resolve(false); // timeout — let server try anyway
-          return;
-        }
-
-        // Guard: torrent might have been destroyed
-        if (!this.torrent || !this.torrent.pieces) {
           resolve(false);
           return;
         }
 
-        let allReady = true;
-        for (let i = startPiece; i <= endPiece; i++) {
-          if (i >= this.torrent.pieces.length) { allReady = false; break; }
-          const piece = this.torrent.pieces[i];
-          if (!piece || piece.missing > 0) {
-            allReady = false;
-            break;
+        // Primary: check piece-level availability
+        const currentPieces = this.pieces;
+        if (currentPieces.length > 0) {
+          let allReady = true;
+          for (let i = startPiece; i <= clampedEnd; i++) {
+            if (!isPieceReady(currentPieces, i)) {
+              allReady = false;
+              break;
+            }
           }
+          if (allReady) { resolve(true); return; }
         }
 
-        if (allReady) {
+        // Fallback: file-level progress (works after piece array corruption)
+        if (this.isDataAvailable(startByte, endByte)) {
           resolve(true);
-        } else {
-          setTimeout(check, 100);
+          return;
         }
+
+        setTimeout(check, 200);
       };
       check();
     });
   }
 
   /**
-   * Estimate bytes per second based on current download speed
+   * Count ready pieces for the video file (safe)
+   */
+  countReadyPieces() {
+    const pieces = this.pieces;
+    if (pieces.length === 0) return { ready: 0, total: 0 };
+
+    let ready = 0;
+    const total = this.fileEndPiece - this.fileStartPiece + 1;
+    for (let i = this.fileStartPiece; i <= this.fileEndPiece && i <= this.maxPieceIndex; i++) {
+      if (isPieceReady(pieces, i)) ready++;
+    }
+    return { ready, total };
+  }
+
+  /**
+   * Estimate bytes per second
    */
   _getBytesPerSec() {
     try {
@@ -306,44 +342,34 @@ export class PiecePrioritizer {
         return speed;
       }
     } catch {}
-    return this.playbackSpeed || 1024 * 1024; // fallback: 1 MB/s
+    return this.playbackSpeed || 1024 * 1024;
   }
 
-  /**
-   * Generate a compact key for deduplicating priority updates
-   */
   _priorityMapKey(priorities) {
-    // Only track HIGHEST and DONT_DOWNLOAD for key (most important)
     const critical = [];
     const blocked = [];
     for (const [piece, priority] of priorities) {
       if (priority === PIECE_PRIORITY.HIGHEST) critical.push(piece);
       if (priority === PIECE_PRIORITY.DONT_DOWNLOAD) blocked.push(piece);
     }
-    return `${critical.join(",")}|${blocked.join(",")}`;
+    return `${critical.length}:${blocked.length}`;
   }
 
   /**
-   * Get stats about current state
+   * Get stats about current state (safe)
    */
   getStats() {
-    const totalPieces = this.fileEndPiece - this.fileStartPiece + 1;
-    let downloaded = 0;
-    let missing = 0;
-
-    for (let i = this.fileStartPiece; i <= this.fileEndPiece; i++) {
-      const piece = this.torrent.pieces[i];
-      if (piece && piece.missing === 0) downloaded++;
-      else missing++;
-    }
-
+    const { ready, total } = this.countReadyPieces();
     return {
-      totalPieces,
-      downloaded,
-      missing,
-      percent: ((downloaded / totalPieces) * 100).toFixed(1),
+      totalPieces: total,
+      downloaded: ready,
+      missing: total - ready,
+      percent: total > 0 ? ((ready / total) * 100).toFixed(1) : "0.0",
       currentOffset: this.currentOffset,
       isSeeking: this.isSeeking,
     };
   }
 }
+
+// Export safe helpers for use by other modules
+export { isPieceReady, getPieceMissing };

@@ -20,10 +20,11 @@ function fmtSpeed(bytesPerSec) {
 }
 
 export class ProgressReporter {
-  constructor(videoFile, torrent, prioritizer) {
+  constructor(videoFile, torrent, prioritizer, streamManager = null) {
     this.videoFile = videoFile;
     this.torrent = torrent;
     this.prioritizer = prioritizer;
+    this._streamManager = streamManager;
 
     this.interval = null;
     this.lastDl = -1;
@@ -67,21 +68,36 @@ export class ProgressReporter {
    * Gather stats from all sources
    */
   _getStats() {
-    const downloaded = this.videoFile.downloaded || 0;
+    // Use manual tracking if available (works after piece corruption)
+    let downloaded = 0;
+    let speed = 0;
+    let peers = 0;
+    try {
+      // Try torrent-level first
+      downloaded = this.torrent?.downloaded || 0;
+      speed = this.torrent?.downloadSpeed || 0;
+      peers = this.torrent?.numPeers || 0;
+    } catch {}
+    // If torrent properties crash, try manual stats
+    if (this._streamManager) {
+      const stats = this._streamManager.getDownloadStats();
+      if (stats.downloaded > downloaded) downloaded = stats.downloaded;
+      if (stats.speed > 0) speed = stats.speed;
+      if (stats.peers > 0) peers = stats.peers;
+    }
     const total = this.videoFile.length || 1;
-    const percent = (downloaded / total) * 100;
+    const percent = Math.min(100, (downloaded / total) * 100);
 
     // Speed (smoothed over 3 samples)
-    const rawSpeed = this.torrent.downloadSpeed || 0;
-    this.lastSpeedSamples.push(rawSpeed);
+    this.lastSpeedSamples.push(speed);
     if (this.lastSpeedSamples.length > 3) this.lastSpeedSamples.shift();
-    const speed = this.lastSpeedSamples.reduce((a, b) => a + b, 0) / this.lastSpeedSamples.length;
+    const avgSpeed = this.lastSpeedSamples.reduce((a, b) => a + b, 0) / this.lastSpeedSamples.length;
 
-    const peers = this.torrent.numPeers || 0;
-    const ratio = this.torrent.ratio || 0;
+    let ratio = 0;
+    try { ratio = this.torrent?.ratio || 0; } catch {}
 
     // Buffering detection
-    const isBuffering = speed < 1024 && percent < 100 && peers > 0;
+    const isBuffering = avgSpeed < 1024 && percent < 100 && peers > 0;
     if (isBuffering && !this.isBuffering) {
       this.isBuffering = true;
       this.bufferingSince = Date.now();
@@ -89,7 +105,7 @@ export class ProgressReporter {
       this.isBuffering = false;
     }
 
-    // Piece-level progress
+    // Piece-level progress (safe, works after corruption)
     const pieceStats = this.prioritizer ? this.prioritizer.getStats() : null;
 
     // Elapsed time
@@ -105,7 +121,7 @@ export class ProgressReporter {
       downloaded,
       total,
       percent,
-      speed,
+      speed: avgSpeed,
       peers,
       ratio,
       isBuffering,
