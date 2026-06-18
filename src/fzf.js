@@ -1,5 +1,10 @@
 import { spawn } from "child_process";
-import chalk from "chalk";
+
+// Strip ANSI escape codes for matching
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+function stripAnsi(str) {
+  return str.replace(ANSI_RE, "");
+}
 
 /**
  * Launch fzf with choices and return the selected value.
@@ -22,7 +27,7 @@ export function fzfSelect(choices, prompt = "Select") {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    // Send choices as lines
+    // Send choices as lines (with ANSI codes — fzf renders them)
     const lines = choices.map((c) => c.name);
     fzf.stdin.write(lines.join("\n"));
     fzf.stdin.end();
@@ -55,8 +60,9 @@ export function fzfSelect(choices, prompt = "Select") {
         return;
       }
 
-      // Find the matching choice
-      const choice = choices.find((c) => c.name === selectedName.trim());
+      // fzf --ansi strips ANSI codes from output, so strip from our names too
+      const stripped = stripAnsi(selectedName.trim());
+      const choice = choices.find((c) => stripAnsi(c.name) === stripped);
       if (choice) {
         resolve(choice.value);
       } else {

@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node bin/rattin.js",
+    "debug": "node scripts/debug.js",
     "deps": "node scripts/check-deps.js",
     "build": "node scripts/build.js",
     "prebuild": "node scripts/check-deps.js"
