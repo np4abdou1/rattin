@@ -187,6 +187,9 @@ export class PiecePrioritizer {
    * Apply priority map to torrent pieces (batched, efficient)
    */
   _applyPriorities(priorities) {
+    // Skip if torrent isn't fully initialized
+    if (!this.torrent || !this.torrent.pieces || this.torrent.pieces.length === 0) return;
+
     // Avoid redundant updates
     const key = this._priorityMapKey(priorities);
     if (key === this._lastPriorityMap) return;
@@ -195,6 +198,8 @@ export class PiecePrioritizer {
     // Batch by priority level for fewer API calls
     const batches = new Map();
     for (const [piece, priority] of priorities) {
+      // Validate piece index is in range
+      if (piece < 0 || piece >= this.torrent.pieces.length) continue;
       if (!batches.has(priority)) batches.set(priority, []);
       batches.get(priority).push(piece);
     }
@@ -237,8 +242,12 @@ export class PiecePrioritizer {
     const { startPiece, endPiece } = this.getPieceRange(startByte, endByte);
     const deadline = Date.now() + timeoutMs;
 
+    // Guard: check torrent is ready
+    if (!this.torrent || !this.torrent.pieces) return false;
+
     // Re-prioritize this range as highest
     for (let i = startPiece; i <= endPiece; i++) {
+      if (i >= this.torrent.pieces.length) break;
       try {
         this.torrent.select(i, i, PIECE_PRIORITY.HIGHEST);
       } catch {}
@@ -251,8 +260,15 @@ export class PiecePrioritizer {
           return;
         }
 
+        // Guard: torrent might have been destroyed
+        if (!this.torrent || !this.torrent.pieces) {
+          resolve(false);
+          return;
+        }
+
         let allReady = true;
         for (let i = startPiece; i <= endPiece; i++) {
+          if (i >= this.torrent.pieces.length) { allReady = false; break; }
           const piece = this.torrent.pieces[i];
           if (!piece || piece.missing > 0) {
             allReady = false;

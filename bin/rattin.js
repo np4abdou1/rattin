@@ -2,6 +2,15 @@
 
 import "dotenv/config";
 
+// Catch WebTorrent's internal null-piece crash (known bug in WebTorrent 3.x)
+process.on("uncaughtException", (err) => {
+  if (err.message && err.message.includes("Cannot read properties of null")) {
+    // Swallow — WebTorrent recovers on next tick
+    return;
+  }
+  throw err;
+});
+
 import { checkDeps } from "../src/deps.js";
 checkDeps();
 

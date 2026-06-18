@@ -3,13 +3,6 @@
  *
  * Orchestrates the entire streaming pipeline:
  *   Torrent → Temp Dir → Piece Prioritizer → HTTP Server → MPV
- *
- * Features:
- *   - Adaptive piece prioritization (seek detection, prefetch)
- *   - HTTP range request server for mpv
- *   - Temp directory with automatic cleanup
- *   - Real-time progress reporting
- *   - Graceful shutdown on SIGINT/SIGTERM
  */
 
 import { spawn } from "child_process";
@@ -40,6 +33,28 @@ function findLargestVideo(files) {
   return best;
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Global handler for WebTorrent's internal null-piece crash
+// This is a known bug in WebTorrent 3.x where _updateWire races
+// with piece array initialization. We catch it and continue.
+let _webtorrentCrashCount = 0;
+process.on("uncaughtException", (err) => {
+  if (err.message && err.message.includes("Cannot read properties of null")) {
+    _webtorrentCrashCount++;
+    // Swallow the crash — WebTorrent will recover on next tick
+    // Only log the first few to avoid spam
+    if (_webtorrentCrashCount <= 3) {
+      process.stderr.write(chalk.gray(`  [webtorrent] recovered from null piece crash (#${_webtorrentCrashCount})\n`));
+    }
+    return; // Don't crash
+  }
+  // For other errors, re-throw
+  throw err;
+});
+
 export class StreamManager {
   constructor(torrentInfo) {
     this.torrentInfo = torrentInfo;
@@ -55,9 +70,6 @@ export class StreamManager {
     this.startTime = Date.now();
   }
 
-  /**
-   * Start the full streaming pipeline
-   */
   async start() {
     const log = (msg) => console.log(chalk.gray(`  ${msg}`));
 
@@ -70,7 +82,7 @@ export class StreamManager {
       const tempDir = this.cleanup.createTempDir();
       log(`Temp: ${tempDir}`);
 
-      // 3. Initialize WebTorrent (downloads to temp dir)
+      // 3. Initialize WebTorrent
       this.client = new WebTorrent({ tempDest: tempDir });
       this.cleanup.onCleanup(() => this._destroyClient());
 
@@ -79,7 +91,11 @@ export class StreamManager {
 
       this.wt = await this._addTorrent(magnet);
 
-      // 4. Select the video file
+      // 4. Wait for WebTorrent internal state to stabilize
+      log("Initializing torrent engine...");
+      await sleep(4000);
+
+      // 5. Select the video file
       const files = this.wt.files;
       log(`${files.length} file(s) in torrent`);
 
@@ -88,30 +104,26 @@ export class StreamManager {
         throw new Error("No video files found in torrent");
       }
 
-      // Select only this file, deselect others
-      for (const f of files) {
-        if (f === this.videoFile) f.select();
-        else f.deselect();
-      }
+      this._safeDeselectOthers();
 
       log(`Playing: ${chalk.green(this.videoFile.name)}`);
       log(`Size: ${fmtBytes(this.videoFile.length)}`);
       log(`Peers: ${this.wt.numPeers}`);
 
-      // 5. Wait for initial pieces
+      // 6. Wait for initial pieces
       log("Waiting for initial pieces...");
-      await this._waitForInitialPieces(4, 30000);
+      await this._waitForPieces(4, 25000);
       log(`Pieces ready: ${this._countReadyPieces()}`);
 
-      // 6. Create piece prioritizer
+      // 7. Create prioritizer
       this.prioritizer = new PiecePrioritizer(
         this.wt,
         this.wt.pieceLength,
         this.videoFile.length
       );
-      log("Piece prioritizer initialized");
+      log("Piece prioritizer ready");
 
-      // 7. Start HTTP server
+      // 8. Start HTTP server
       this.server = new StreamServer(
         this.videoFile,
         this.wt,
@@ -122,16 +134,16 @@ export class StreamManager {
       this.cleanup.onCleanup(() => this.server.stop());
       log(`Server: ${this.server.getUrl()}`);
 
-      // 8. Start progress reporter
+      // 9. Start progress reporter
       this.progress = new ProgressReporter(this.videoFile, this.wt, this.prioritizer);
       this.progress.start(1000);
       this.cleanup.onCleanup(() => this.progress.stop());
 
-      // 9. Launch MPV
+      // 10. Launch MPV
       log("Launching MPV...");
       await this._launchMpv(this.server.getUrl());
 
-      // 10. Done
+      // 11. Done
       this.progress.printSummary();
       await this.cleanup.cleanup();
 
@@ -144,9 +156,6 @@ export class StreamManager {
     }
   }
 
-  /**
-   * Add a magnet to WebTorrent and wait for metadata
-   */
   _addTorrent(magnet) {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
@@ -155,9 +164,7 @@ export class StreamManager {
 
       let torrent;
       try {
-        torrent = this.client.add(magnet, {
-          deselect: true,
-        });
+        torrent = this.client.add(magnet, { deselect: true });
       } catch (err) {
         clearTimeout(timeout);
         reject(err);
@@ -173,63 +180,48 @@ export class StreamManager {
         clearTimeout(timeout);
         reject(err);
       });
+
+      torrent.on("warning", () => {});
     });
   }
 
-  /**
-   * Wait for initial pieces before starting server
-   */
-  _waitForInitialPieces(minPieces, timeoutMs) {
+  _waitForPieces(minPieces, timeoutMs) {
     return new Promise((resolve) => {
       const deadline = Date.now() + timeoutMs;
-      const fileStart = Math.floor(this.videoFile.offset / this.wt.pieceLength);
-      const fileEnd = Math.floor((this.videoFile.offset + this.videoFile.length - 1) / this.wt.pieceLength);
-
-      // Prioritize the beginning of the file
-      try {
-        this.wt.select(fileStart, fileStart + 50, 3);
-      } catch {}
 
       const check = () => {
-        if (Date.now() > deadline) {
-          resolve();
-          return;
-        }
+        if (Date.now() > deadline) { resolve(); return; }
+        if (!this.wt || !this.wt.pieces) { resolve(); return; }
 
         let ready = 0;
-        for (let i = fileStart; i <= Math.min(fileStart + 100, fileEnd); i++) {
+        const total = Math.min(this.wt.pieces.length, 100);
+        for (let i = 0; i < total; i++) {
           const piece = this.wt.pieces[i];
           if (piece && piece.missing === 0) ready++;
         }
 
-        if (ready >= minPieces) {
-          resolve();
-        } else {
-          setTimeout(check, 200);
-        }
+        if (ready >= minPieces) resolve();
+        else setTimeout(check, 500);
       };
 
       check();
     });
   }
 
-  /**
-   * Count ready pieces for the video file
-   */
   _countReadyPieces() {
+    if (!this.wt || !this.wt.pieces) return "0/0";
     const start = Math.floor(this.videoFile.offset / this.wt.pieceLength);
     const end = Math.floor((this.videoFile.offset + this.videoFile.length - 1) / this.wt.pieceLength);
     let ready = 0;
+    const total = end - start + 1;
     for (let i = start; i <= end; i++) {
+      if (i >= this.wt.pieces.length) break;
       const piece = this.wt.pieces[i];
       if (piece && piece.missing === 0) ready++;
     }
-    return `${ready}/${end - start + 1}`;
+    return `${ready}/${total}`;
   }
 
-  /**
-   * Select the best video file from torrent
-   */
   _selectFile(files) {
     if (this.torrentInfo.fileIdx !== undefined &&
         this.torrentInfo.fileIdx >= 0 &&
@@ -239,9 +231,16 @@ export class StreamManager {
     return findLargestVideo(files);
   }
 
-  /**
-   * Launch mpv with the stream URL
-   */
+  _safeDeselectOthers() {
+    try {
+      for (const f of this.wt.files) {
+        if (f !== this.videoFile) {
+          try { f.deselect(); } catch {}
+        }
+      }
+    } catch {}
+  }
+
   _launchMpv(streamUrl) {
     return new Promise((resolve, reject) => {
       this.mpv = spawn("mpv", [
@@ -265,10 +264,7 @@ export class StreamManager {
         }
       });
 
-      this.mpv.on("close", (code) => {
-        resolve(code);
-      });
-
+      this.mpv.on("close", (code) => resolve(code));
       this.mpv.on("error", (err) => {
         console.error(chalk.red(`  MPV error: ${err.message}`));
         reject(err);
@@ -276,28 +272,18 @@ export class StreamManager {
     });
   }
 
-  /**
-   * Destroy the WebTorrent client
-   */
   async _destroyClient() {
     if (this.wt) {
-      try {
-        this.wt.destroy();
-      } catch {}
+      try { this.wt.destroy(); } catch {}
       this.wt = null;
     }
     if (this.client) {
-      try {
-        this.client.destroy();
-      } catch {}
+      try { this.client.destroy(); } catch {}
       this.client = null;
     }
   }
 }
 
-/**
- * Convenience function — stream a torrent and play with mpv
- */
 export async function playWithMpv(torrentInfo) {
   const manager = new StreamManager(torrentInfo);
   await manager.start();
