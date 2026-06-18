@@ -136,6 +136,10 @@ export class CleanupManager {
    * Handle uncaught exceptions
    */
   async _onUncaught(err) {
+    // Ignore WebTorrent 3.x internal null-piece crash
+    if (err && err.message && err.message.includes("Cannot read properties of null")) {
+      return; // WebTorrent recovers on next tick
+    }
     console.error(`\n  Uncaught error: ${err.message}`);
     await this.cleanup();
     process.exit(1);

@@ -3,12 +3,13 @@
 import "dotenv/config";
 
 // Catch WebTorrent's internal null-piece crash (known bug in WebTorrent 3.x)
+// All other errors are handled by cleanup.js's own uncaughtException handler
 process.on("uncaughtException", (err) => {
   if (err.message && err.message.includes("Cannot read properties of null")) {
     // Swallow — WebTorrent recovers on next tick
     return;
   }
-  throw err;
+  // For other errors, do NOT rethrow — let cleanup.js's handler process them
 });
 
 import { checkDeps } from "../src/deps.js";

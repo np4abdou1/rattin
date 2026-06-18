@@ -51,8 +51,8 @@ process.on("uncaughtException", (err) => {
     }
     return; // Don't crash
   }
-  // For other errors, re-throw
-  throw err;
+  // Other errors — let cleanup.js handle them via its own uncaughtException handler
+  // (do NOT rethrow here — that causes a fatal crash before cleanup runs)
 });
 
 export class StreamManager {
