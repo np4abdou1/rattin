@@ -8,12 +8,19 @@ function stripAnsi(str) {
 
 /**
  * Launch fzf with choices and return the selected value.
+ * Colors show in fzf, matching uses stripped text.
  * @param {Array<{name: string, value: any}>} choices
  * @param {string} prompt
  * @returns {Promise<any>}
  */
 export function fzfSelect(choices, prompt = "Select") {
   return new Promise((resolve, reject) => {
+    // Map stripped name → choice for reliable matching
+    const strippedMap = new Map();
+    for (const c of choices) {
+      strippedMap.set(stripAnsi(c.name).trim(), c);
+    }
+
     const fzf = spawn("fzf", [
       "--prompt", `${prompt} > `,
       "--ansi",
@@ -21,48 +28,26 @@ export function fzfSelect(choices, prompt = "Select") {
       "--reverse",
       "--border",
       "--info", "inline",
-      "--expect", "enter",
-      "--bind", "tab:accept",
     ], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    // Send choices as lines (with ANSI codes — fzf renders them)
-    const lines = choices.map((c) => c.name);
-    fzf.stdin.write(lines.join("\n"));
+    // Send colored names to fzf — renders with colors
+    fzf.stdin.write(choices.map((c) => c.name).join("\n"));
     fzf.stdin.end();
 
     let stdout = "";
-    let stderr = "";
-
-    fzf.stdout.on("data", (data) => {
-      stdout += data.toString();
-    });
-
-    fzf.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
+    fzf.stdout.on("data", (data) => { stdout += data.toString(); });
 
     fzf.on("close", (code) => {
-      // fzf returns 1 when user cancels (Esc/Ctrl-C)
-      if (code !== 0 && !stdout.trim()) {
+      if (code !== 0 || !stdout.trim()) {
         reject(new Error("ExitPromptError"));
         return;
       }
 
-      // --expect prepends the key pressed on the first line
-      const outputLines = stdout.trim().split("\n");
-      // Skip the first line (expect key) and get the selection
-      const selectedName = outputLines[1] || outputLines[0];
-
-      if (!selectedName) {
-        reject(new Error("ExitPromptError"));
-        return;
-      }
-
-      // fzf --ansi strips ANSI codes from output, so strip from our names too
-      const stripped = stripAnsi(selectedName.trim());
-      const choice = choices.find((c) => stripAnsi(c.name) === stripped);
+      // fzf --ansi strips colors from output, so match against stripped names
+      const selected = stripAnsi(stdout.trim());
+      const choice = strippedMap.get(selected);
       if (choice) {
         resolve(choice.value);
       } else {
@@ -70,8 +55,6 @@ export function fzfSelect(choices, prompt = "Select") {
       }
     });
 
-    fzf.on("error", (err) => {
-      reject(err);
-    });
+    fzf.on("error", (err) => reject(err));
   });
 }
