@@ -40,7 +40,7 @@ import { execSync, spawn } from "child_process";
 import WebTorrent from "webtorrent";
 import { searchTMDB, fetchTVDetails } from "../src/tmdb.js";
 import { searchTorrents, buildMagnet } from "../src/torrent.js";
-import { createSafeTorrent } from "../src/stream/safe-torrent.js";
+import { createSafeClient, createSafeTorrent } from "../src/stream/safe-torrent.js";
 import { PiecePrioritizer, isPieceReady } from "../src/stream/prioritizer.js";
 import { StreamServer } from "../src/stream/server.js";
 import { CleanupManager } from "../src/stream/cleanup.js";
@@ -148,7 +148,7 @@ async function testWebTorrent(torrentInfo) {
   const tempDir = path.join(os.tmpdir(), `rattin-debug-${Date.now()}`);
   fs.mkdirSync(tempDir, { recursive: true });
 
-  const client = new WebTorrent({ tempDest: tempDir });
+  const client = await createSafeClient({ tempDest: tempDir });
   const magnet = buildMagnet(torrentInfo);
 
   console.log(chalk.gray("  Adding torrent..."));

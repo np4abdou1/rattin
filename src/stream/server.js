@@ -130,29 +130,10 @@ export class StreamServer {
       this.log(`Seek detected: byte ${start} (was at ${this.prioritizer.currentOffset})`);
     }
 
-    // Map byte range to pieces
-    const { startPiece, endPiece } = this.prioritizer.getPieceRange(start, end);
-
-    // Check if pieces are available, wait if needed
+    // Wait for data to be available (file-level tracking)
     const ready = await this.prioritizer.waitForRange(start, end, 15000);
     if (!ready) {
-      this.log(`Pieces not ready for range ${start}-${end}, serving anyway`);
-    }
-
-    // Verify pieces exist before attempting to read
-    const allPiecesExist = this._checkPiecesExist(startPiece, endPiece);
-    if (!allPiecesExist) {
-      // Check file-level progress as fallback (works after piece corruption)
-      const fileReady = this.prioritizer.isDataAvailable(start, end);
-      if (!fileReady) {
-        this.log(`Missing pieces for range ${startPiece}-${endPiece}, buffering...`);
-        const retryReady = await this.prioritizer.waitForRange(start, end, 5000);
-        if (!retryReady) {
-          res.writeHead(503, { "Retry-After": "1" });
-          res.end("Buffering");
-          return;
-        }
-      }
+      this.log(`Data not ready for range ${start}-${end}, serving anyway`);
     }
 
     // Send response

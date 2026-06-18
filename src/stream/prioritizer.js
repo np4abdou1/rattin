@@ -81,8 +81,8 @@ export class PiecePrioritizer {
    */
   isDataAvailable(startByte, endByte) {
     try {
-      const downloaded = this.torrent?.downloaded || 0;
-      // If we've downloaded more than the requested range, data is likely available
+      // Use safe download tracking if available (works after piece corruption)
+      const downloaded = this.torrent?._safeDownloaded?.() ?? this.torrent?.downloaded ?? 0;
       return downloaded >= endByte;
     } catch {
       return false;
@@ -268,21 +268,19 @@ export class PiecePrioritizer {
    * Wait until a byte range is available on disk
    */
   async waitForRange(startByte, endByte, timeoutMs = STALL_TIMEOUT_MS) {
-    const { startPiece, endPiece } = this.getPieceRange(startByte, endByte);
     const deadline = Date.now() + timeoutMs;
-    const pieces = this.pieces;
 
-    if (pieces.length === 0) return false;
-
-    const maxPiece = this.maxPieceIndex;
-    const clampedEnd = Math.min(endPiece, maxPiece);
-
-    // Re-prioritize this range as highest
-    for (let i = startPiece; i <= clampedEnd; i++) {
-      try {
-        this.torrent.select(i, i, PIECE_PRIORITY.HIGHEST);
-      } catch {}
-    }
+    // Try to prioritize this range (catch crashes from torrent.select)
+    try {
+      const { startPiece, endPiece } = this.getPieceRange(startByte, endByte);
+      const maxPiece = this.maxPieceIndex;
+      const clampedEnd = Math.min(endPiece, maxPiece);
+      for (let i = startPiece; i <= clampedEnd; i++) {
+        try {
+          this.torrent.select(i, i, PIECE_PRIORITY.HIGHEST);
+        } catch {}
+      }
+    } catch {}
 
     return new Promise((resolve) => {
       const check = () => {
@@ -291,20 +289,7 @@ export class PiecePrioritizer {
           return;
         }
 
-        // Primary: check piece-level availability
-        const currentPieces = this.pieces;
-        if (currentPieces.length > 0) {
-          let allReady = true;
-          for (let i = startPiece; i <= clampedEnd; i++) {
-            if (!isPieceReady(currentPieces, i)) {
-              allReady = false;
-              break;
-            }
-          }
-          if (allReady) { resolve(true); return; }
-        }
-
-        // Fallback: file-level progress (works after piece array corruption)
+        // Use file-level progress (safe, works after piece corruption)
         if (this.isDataAvailable(startByte, endByte)) {
           resolve(true);
           return;

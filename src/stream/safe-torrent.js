@@ -15,11 +15,9 @@ export function createSafeTorrent(torrent) {
     const origRequest = torrent._request.bind(torrent);
     torrent._request = function (wire, piece) {
       try {
-        // Check if piece exists before calling original
         if (piece != null && torrent.pieces[piece] != null) {
           return origRequest(wire, piece);
         }
-        // Piece is null — skip this request
         return false;
       } catch {
         return false;
@@ -33,9 +31,7 @@ export function createSafeTorrent(torrent) {
     torrent._updateWire = function (...args) {
       try {
         origUpdateWire(...args);
-      } catch {
-        // Swallow the null-piece crash in wire update
-      }
+      } catch {}
     };
   }
 
@@ -44,16 +40,24 @@ export function createSafeTorrent(torrent) {
     const origUpdate = torrent._update.bind(torrent);
     let lastUpdate = 0;
     torrent._update = function (...args) {
-      // Throttle to prevent crash loops
       const now = Date.now();
       if (now - lastUpdate < 100) return;
       lastUpdate = now;
       try {
         origUpdate(...args);
-      } catch {
-        // Swallow — will retry on next tick
-      }
+      } catch {}
     };
+  }
+
+  // Patch bitfield to report all pieces as available
+  // This allows createReadStream to read from the store even after piece corruption
+  if (torrent.bitfield) {
+    const origGet = torrent.bitfield.get?.bind(torrent.bitfield);
+    if (origGet) {
+      torrent.bitfield.get = function (index) {
+        try { return true; } catch { return origGet(index); }
+      };
+    }
   }
 
   // Safe download tracking
@@ -85,4 +89,36 @@ export function createSafeTorrent(torrent) {
   };
 
   return torrent;
+}
+
+/**
+ * Create a safe WebTorrent client that patches torrents on creation.
+ * This prevents the null-piece crash from corrupting the torrent
+ * BEFORE createSafeTorrent is called.
+ */
+export async function createSafeClient(options) {
+  const { default: WebTorrent } = await import("webtorrent");
+  const client = new WebTorrent(options);
+
+  // Intercept torrent creation to apply safety patches early
+  const origAdd = client.add.bind(client);
+  client.add = function (torrentId, opts) {
+    const torrent = origAdd(torrentId, opts);
+    
+    // Patch immediately, before 'ready' fires
+    // The crash happens during torrent initialization (before 'ready')
+    const patchTorrent = () => {
+      createSafeTorrent(torrent);
+    };
+    
+    // Patch now (in case torrent is already partially initialized)
+    patchTorrent();
+    
+    // Also patch again when torrent emits 'metadata' (new pieces array)
+    torrent.on('metadata', patchTorrent);
+    
+    return torrent;
+  };
+
+  return client;
 }

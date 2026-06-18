@@ -8,7 +8,7 @@
 import { spawn } from "child_process";
 import chalk from "chalk";
 import WebTorrent from "webtorrent";
-import { createSafeTorrent } from "./safe-torrent.js";
+import { createSafeTorrent, createSafeClient } from "./safe-torrent.js";
 import { PiecePrioritizer, isPieceReady } from "./prioritizer.js";
 import { StreamServer } from "./server.js";
 import { ProgressReporter } from "./progress.js";
@@ -71,7 +71,7 @@ export class StreamManager {
       log(`Temp: ${tempDir}`);
 
       // 3. Initialize WebTorrent
-      this.client = new WebTorrent({ tempDest: tempDir });
+      this.client = await createSafeClient({ tempDest: tempDir });
       this.cleanup.onCleanup(() => this._destroyClient());
 
       const magnet = buildMagnet(this.torrentInfo);
