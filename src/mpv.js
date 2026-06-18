@@ -1,18 +1,8 @@
 import { spawn } from "child_process";
+import http from "http";
 import chalk from "chalk";
 import WebTorrent from "webtorrent";
 import { buildMagnet } from "./torrent.js";
-
-const TRACKERS = [
-  "udp://tracker.opentrackr.org:1337/announce",
-  "udp://open.stealth.si:80/announce",
-  "udp://tracker.torrent.eu.org:451/announce",
-  "udp://tracker.bittor.pw:1337/announce",
-  "udp://public.popcorn-tracker.org:6969/announce",
-  "udp://tracker.dler.org:6969/announce",
-  "udp://exodus.desync.com:6969",
-  "udp://open.demonii.com:1337/announce",
-];
 
 function fmtBytes(bytes) {
   if (!bytes || bytes === 0) return "0 B";
@@ -79,62 +69,97 @@ export function playWithMpv(torrent) {
       console.log(chalk.gray(`  Peers: ${wt.numPeers}`));
       console.log();
 
-      // Create a readable stream and pipe it to mpv via stdin
-      const stream = videoFile.createReadStream();
+      // Serve the file over HTTP so mpv can stream it properly
+      const PORT = 0; // random available port
+      const server = http.createServer((req, res) => {
+        const range = req.headers.range;
+        const fileSize = videoFile.length;
 
-      const mpv = spawn("mpv", [
-        "--no-terminal",
-        "--force-seekable=yes",
-        "--cache=yes",
-        "--demuxer-max-bytes=50MiB",
-        "--demuxer-readahead-secs=30",
-        "--hr-seek=yes",
-        "-",
-      ], {
-        stdio: ["pipe", "inherit", "inherit"],
+        if (range) {
+          const parts = range.replace(/bytes=/, "").split("-");
+          const start = parseInt(parts[0], 10);
+          const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+          const chunkSize = end - start + 1;
+
+          res.writeHead(206, {
+            "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+            "Accept-Ranges": "bytes",
+            "Content-Length": chunkSize,
+            "Content-Type": "video/x-matroska",
+          });
+
+          const stream = videoFile.createReadStream({ start, end });
+          stream.pipe(res);
+          stream.on("error", () => { res.destroy(); });
+          res.on("close", () => { stream.destroy(); });
+        } else {
+          res.writeHead(200, {
+            "Content-Length": fileSize,
+            "Content-Type": "video/x-matroska",
+            "Accept-Ranges": "bytes",
+          });
+
+          const stream = videoFile.createReadStream();
+          stream.pipe(res);
+          stream.on("error", () => { res.destroy(); });
+          res.on("close", () => { stream.destroy(); });
+        }
       });
 
-      stream.pipe(mpv.stdin);
-      mpv.stdin.on("error", () => {});
+      server.listen(0, "127.0.0.1", () => {
+        const port = server.address().port;
+        const streamUrl = `http://127.0.0.1:${port}/`;
 
-      // Progress reporter — use wt.progress (torrent-level, safe)
-      let lastProgress = 0;
-      const progressInterval = setInterval(() => {
-        try {
-          const pctNum = wt.progress || 0;
-          if (pctNum !== lastProgress) {
-            lastProgress = pctNum;
-            const pct = (pctNum * 100).toFixed(1);
-            const dl = fmtBytes(wt.downloadSpeed) + "/s";
+        console.log(chalk.gray(`  HTTP server on port ${port}`));
+        console.log(chalk.gray("  Launching MPV..."));
+
+        const mpv = spawn("mpv", [
+          "--no-terminal",
+          "--force-seekable=yes",
+          "--cache=yes",
+          "--demuxer-max-bytes=75MiB",
+          "--demuxer-readahead-secs=60",
+          "--hr-seek=yes",
+          "--cache-secs=60",
+          streamUrl,
+        ], {
+          stdio: ["ignore", "inherit", "inherit"],
+        });
+
+        // Progress — track downloaded bytes of the selected file
+        let lastDl = 0;
+        const progressInterval = setInterval(() => {
+          try {
+            const dl = videoFile.downloaded || 0;
+            const total = videoFile.length || 1;
+            const pct = ((dl / total) * 100).toFixed(1);
+            const speed = fmtBytes(wt.downloadSpeed) + "/s";
             const peers = wt.numPeers;
-            process.stdout.write(
-              `\r${chalk.gray("  Downloading:")} ${chalk.cyan(pct + "%")} ${chalk.gray("|")} ${chalk.green(dl)} ${chalk.gray("|")} ${chalk.yellow(peers + " peers")}`
-            );
-          }
-        } catch {}
-      }, 1000);
+            if (dl !== lastDl) {
+              lastDl = dl;
+              process.stdout.write(
+                `\r${chalk.gray("  Downloading:")} ${chalk.cyan(pct + "%")} ${chalk.gray("|")} ${chalk.green(speed)} ${chalk.gray("|")} ${chalk.yellow(peers + " peers")}`
+              );
+            }
+          } catch {}
+        }, 1000);
 
-      mpv.on("close", () => {
-        clearInterval(progressInterval);
-        process.stdout.write("\r" + " ".repeat(80) + "\r");
-        console.log(chalk.gray("  MPV closed."));
-        client.destroy();
-        resolve();
-      });
+        mpv.on("close", () => {
+          clearInterval(progressInterval);
+          process.stdout.write("\r" + " ".repeat(80) + "\r");
+          console.log(chalk.gray("  MPV closed."));
+          server.close();
+          client.destroy();
+          resolve();
+        });
 
-      mpv.on("error", (err) => {
-        clearInterval(progressInterval);
-        console.error(chalk.red(`  MPV error: ${err.message}`));
-        client.destroy();
-        reject(err);
-      });
-
-      stream.on("error", (err) => {
-        clearInterval(progressInterval);
-        console.error(chalk.red(`  Stream error: ${err.message}`));
-        mpv.kill();
-        client.destroy();
-        reject(err);
+        mpv.on("error", (err) => {
+          clearInterval(progressInterval);
+          console.error(chalk.red(`  MPV error: ${err.message}`));
+          server.close();
+          client.destroy();
+          reject(err);
+        });
       });
     });
 
